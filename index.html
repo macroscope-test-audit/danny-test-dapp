@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Danny Wallet Phase 2 — Test dApp (zero-value audit page)</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:900px;margin:0 auto;padding:16px;color:#111;background:#fff}
+  h1{font-size:20px} h2{font-size:16px;margin-top:28px;border-top:1px solid #ccc;padding-top:12px}
+  .warn{background:#fff3cd;border:1px solid #d9a400;padding:10px;border-radius:6px}
+  .box{border:1px solid #bbb;border-radius:6px;padding:10px;margin:8px 0}
+  button{margin:4px 4px 4px 0;padding:7px 12px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  input[type=text]{width:100%;padding:6px;margin:4px 0;box-sizing:border-box;font-family:monospace}
+  textarea{width:100%;min-height:64px;font-family:monospace;box-sizing:border-box}
+  pre#log{background:#111;color:#0f0;padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word;max-height:420px;overflow:auto;font-size:12px}
+  pre.out{background:#f4f4f4;padding:8px;border-radius:6px;white-space:pre-wrap;word-break:break-word;font-size:12px}
+  label{font-weight:600;font-size:13px}
+  .note{font-size:13px;color:#444}
+  #qrcode img{margin:8px 0}
+  iframe#evilFrame{width:100%;height:90px;border:1px solid #999}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+<h1>Danny Wallet Phase 2 — Test dApp (TB-02 / TB-03 / TB-01-C)</h1>
+<div class="warn"><b>ZERO-VALUE TEST PAGE ONLY.</b> Built for the Danny Wallet bug-bounty audit (Phase 2). No real funds anywhere: every transaction has value 0, every Permit is a signature-only display test and is never submitted on-chain. <b>Never enter a seed phrase, private key, or PIN on this page.</b> This page asks for none of those. All requests and responses are logged verbatim on this page so the tester can record exactly what the wallet's confirmation screens show.</div>
+<p class="note">Wallet under test: Danny Wallet web app (app.dannywallet.com), Danny Chain chainId 5069, own test wallets only. Load this page in the wallet's Explorer dApp browser and/or in a normal browser tab.</p>
+
+<h2>0 — Environment probe (auto-runs on load)</h2>
+<div class="box"><pre class="out" id="envOut">running…</pre>
+<button id="btnEnv" type="button">Re-run environment probe</button></div>
+
+<h2>1 — Provider / sandbox probe (TB-01-C, TB-02-D1)</h2>
+<div class="box">
+<button id="btnReqAcct" type="button">Request accounts via window.ethereum (eth_requestAccounts)</button>
+<button id="btnPostParent" type="button">Send postMessage to parent window (test payload)</button>
+<p class="note">If this page runs inside the wallet's dApp-browser iframe, the probe above reports whether a provider is injected and what sandbox flags are visible. Incoming postMessage events are logged below (log only — this page takes NO action on received messages).</p>
+</div>
+
+<h2>2 — WalletConnect v2 pairing (wallet's only dApp-connect path)</h2>
+<div class="box">
+<label for="wcProjectId">WalletConnect Cloud projectId (required — free at https://cloud.walletconnect.com)</label>
+<input type="text" id="wcProjectId" placeholder="paste a free WalletConnect Cloud projectId here — pairing cannot be created without one" autocomplete="off">
+<p class="note">No public/demo projectId is bundled on purpose: reusing another project's published projectId would be using someone else's credential. Get a free one at cloud.walletconnect.com (free tier, no payment). If pairing is attempted without one, the exact error is logged below — that failure is itself evidence.</p>
+<button id="btnWcInit" type="button">Init SignClient</button>
+<button id="btnWcPair" type="button">Create pairing (shows URI + QR)</button>
+<button id="btnWcDisconnect" type="button">Disconnect session</button>
+<div id="wcStatus">Status: not initialised.</div>
+<label for="wcUri">Pairing URI (copy into the wallet's /wallet/connect "paste URI" field)</label>
+<textarea id="wcUri" readonly placeholder="pairing URI appears here after Create pairing"></textarea>
+<button id="btnWcCopy" type="button">Copy pairing URI</button>
+<div id="qrcode"></div>
+<label>Session accounts</label>
+<pre class="out" id="wcAccounts">(none)</pre>
+</div>
+
+<h2>3 — Test inputs (paste at run time — nothing here is a secret)</h2>
+<div class="box">
+<label for="inToken">Token contract address (for spoofed-token Permit + multicall legs)</label>
+<input type="text" id="inToken" placeholder="0x… token contract (fake DAN / fake stablecoin — own deployment, zero value)" autocomplete="off">
+<label for="inSpender">Spender address ("attacker-controlled" — use test wallet B's address)</label>
+<input type="text" id="inSpender" value="0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF" autocomplete="off">
+<label for="inRecipient">Lookalike recipient address (shares first/last 4 chars with a known address, differs in the middle)</label>
+<input type="text" id="inRecipient" placeholder="0x… lookalike recipient" autocomplete="off">
+<label for="inMulticall">Multicall contract address on Danny Chain (for the permit+transfer bundle leg)</label>
+<input type="text" id="inMulticall" placeholder="0x… multicall contract on chain 5069 (leave empty to skip)" autocomplete="off">
+<label for="inCalldata">Calldata to decode (hex)</label>
+<input type="text" id="inCalldata" placeholder="0x… calldata" autocomplete="off">
+</div>
+
+<h2>4 — Signing requests (TB-02-A/B/C)</h2>
+<div class="box">
+<p class="note">Every button sends ONE request via the WalletConnect session if connected, else via window.ethereum if injected, else it logs "no session and no provider". The request and the wallet's response/error are logged verbatim. <b>Record what the wallet's confirmation screen shows for each one</b> (spender, amount, token, chain, warnings, checkbox state) — the screen is the evidence, not the signature.</p>
+<button id="btnPersonal" type="button">personal_sign — plain text message</button>
+<button id="btnEthSign" type="button">eth_sign — raw hex payload (decodes to "TRANSFER ALL FUNDS")</button>
+<button id="btnPermit2612" type="button">Permit EIP-2612 — UNLIMITED approval (max uint256)</button>
+<button id="btnPermit2" type="button">Permit2 — UNLIMITED approval (different struct/domain)</button>
+<button id="btnPermitDai" type="button">Permit Dai-style (allowed=true)</button>
+<button id="btnPermit3009" type="button">Permit EIP-3009 transferWithAuthorization (value 0, gasless transfer)</button>
+<button id="btnNested" type="button">Typed-data nested structs + arrays (decoder truncation test)</button>
+<button id="btnMulticall" type="button">Multicall — transfer + approve in ONE tx (value 0)</button>
+<br>
+<label><input type="checkbox" id="unlimitedAck"> I understand this requests an UNLIMITED approval</label>
+<span class="note">(checkbox state is logged with every Permit request — TB-02-A7 stickiness test)</span>
+<br>
+<button id="btnPermitAgain" type="button">Permit EIP-2612 #2 — UNLIMITED again (checkbox stickiness: does it stay checked?)</button>
+<button id="btnPermitSpoof" type="button">Permit EIP-2612 — SPOOFED token (token address input, name "DAN")</button>
+<br>
+<button id="btnLookalike" type="button">Send tx to LOOKALIKE recipient (value 0)</button>
+<button id="btnChainOk" type="button">Typed-data chainId 5069 (correct chain)</button>
+<button id="btnChainWrong" type="button">Typed-data chainId 1 (WRONG chain — display test)</button>
+<button id="btnDecode" type="button">Decode calldata input (selector + args)</button>
+<br>
+<button id="btnReplay" type="button">Replay — send the SAME personal_sign twice in a row</button>
+<button id="btnRace" type="button">Race — fire personal_sign from account 1, then immediately from account 2</button>
+</div>
+
+<h2>5 — Origin confusion (TB-02-D2/D3)</h2>
+<div class="box">
+<p class="note">Unrelated-origin iframe below (example.com — inert). It cannot post messages to this page because it is not our code; the simulate button below fabricates the exact MessageEvent a malicious origin could send, so we can record what this page does with it (answer: log only, no action).</p>
+<iframe id="evilFrame" src="https://example.com" title="unrelated-origin iframe"></iframe>
+<br>
+<button id="btnForgeMsg" type="button">Simulate forged postMessage (origin https://evil.example, fake wallet message)</button>
+<button id="btnSessionReuse" type="button">Session-reuse probe — fire personal_sign again AFTER loading the unrelated iframe</button>
+</div>
+
+<h2>Log (verbatim — copy this into the test result file)</h2>
+<pre id="log">[log starts]</pre>
+<button id="btnClearLog" type="button">Clear log</button>
+<button id="btnCopyLog" type="button">Copy log to clipboard</button>
+
+<script>
+/* Danny Wallet Phase 2 test dApp — zero-value signing/display tests only.
+   No seeds, no private keys, no PINs. All txs value 0; Permits are
+   signature-only display tests, never submitted on-chain. */
+var TD = { client: null, session: null, topic: null, accounts: [] };
+var CHAIN = 5069;
+var SPENDER_DEFAULT = '0xDeaDbeefdEAdbeefdEadbEEFdeadbeEFdEaDbeeF';
+var PERMIT2_ADDR = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
+
+function ts(){ return new Date().toISOString().slice(11,19); }
+function log(msg){
+  var el = document.getElementById('log');
+  el.textContent += '\n[' + ts() + '] ' + msg;
+  el.scrollTop = el.scrollHeight;
+  try { console.log('[test-dapp]', msg); } catch(e){}
+}
+function getAccount(){
+  if (TD.accounts.length) return TD.accounts[0].split(':').pop();
+  return null;
+}
+function val(id){ return document.getElementById(id).value.trim(); }
+function needAddr(v, label){
+  if (!v || !/^0x[0-9a-fA-F]{40}$/.test(v)) { log('SKIP: ' + label + ' needs a valid 0x address in its input field (got: "' + v + '")'); return false; }
+  return true;
+}
+
+/* ---------- 0. environment probe ---------- */
+function envProbe(){
+  var out = [];
+  out.push('origin: ' + location.origin);
+  out.push('href: ' + location.href);
+  out.push('top === self (not framed): ' + (window.top === window.self));
+  try {
+    var fe = window.frameElement;
+    out.push('frameElement: ' + (fe ? ('tag=' + fe.tagName + ' sandbox=' + (fe.getAttribute('sandbox') || '(none)')) : 'null (top-level page)'));
+  } catch(e) { out.push('frameElement: ACCESS BLOCKED (cross-origin parent) — ' + e.message); }
+  out.push('window.ethereum: ' + (typeof window.ethereum === 'undefined' ? 'ABSENT — no injected provider' : 'PRESENT'));
+  if (typeof window.ethereum !== 'undefined') {
+    try { out.push('window.ethereum keys: ' + Object.keys(window.ethereum).join(', ')); } catch(e){ out.push('window.ethereum keys: unreadable — ' + e.message); }
+    try { out.push('window.ethereum.isMetaMask: ' + window.ethereum.isMetaMask + ' | chainId: ' + window.ethereum.chainId); } catch(e){}
+  }
+  out.push('userAgent: ' + navigator.userAgent);
+  out.push('ethers (v5 UMD): ' + (typeof ethers === 'undefined' ? 'FAILED TO LOAD' : 'loaded, v' + ethers.version));
+  out.push('QRCode lib: ' + (typeof QRCode === 'undefined' ? 'FAILED TO LOAD' : 'loaded'));
+  document.getElementById('envOut').textContent = out.join('\n');
+  log('ENV PROBE:\n' + out.join('\n'));
+}
+
+/* ---------- 1. postMessage listener (log only — never acts) ---------- */
+window.addEventListener('message', function(ev){
+  var data;
+  try { data = JSON.stringify(ev.data); } catch(e){ data = String(ev.data); }
+  if (data && data.length > 500) data = data.slice(0,500) + '…[truncated]';
+  log('MSG RECEIVED origin=' + ev.origin + ' data=' + data + ' — NO ACTION TAKEN (log only)');
+});
+
+/* ---------- 1. provider buttons ---------- */
+async function requestAccounts(){
+  if (typeof window.ethereum === 'undefined') { log('eth_requestAccounts: window.ethereum ABSENT — no injected provider to ask'); return; }
+  log('eth_requestAccounts: sending via window.ethereum…');
+  try {
+    var accts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    log('eth_requestAccounts RESULT: ' + JSON.stringify(accts));
+  } catch(e) { log('eth_requestAccounts ERROR: ' + (e && (e.message || e.code)) + ' ' + JSON.stringify(e)); }
+}
+function postToParent(){
+  var payload = { type: 'danny-test-dapp', payload: 'hello-parent', ts: Date.now() };
+  try {
+    window.parent.postMessage(payload, '*');
+    log('postMessage to parent SENT: ' + JSON.stringify(payload) + ' (targetOrigin *)');
+  } catch(e) { log('postMessage to parent ERROR: ' + e.message); }
+}
+
+/* ---------- generic request sender: WC session first, else injected provider ---------- */
+async function sendReq(method, params){
+  var acct = getAccount();
+  log('REQUEST method=' + method + ' params=' + JSON.stringify(params).slice(0, 1200));
+  if (TD.session && TD.client) {
+    try {
+      var res = await TD.client.request({ topic: TD.topic, chainId: 'eip155:' + CHAIN, request: { method: method, params: params } });
+      log('RESPONSE (WalletConnect) method=' + method + ' result=' + JSON.stringify(res).slice(0, 1200));
+      return res;
+    } catch(e) { log('ERROR (WalletConnect) method=' + method + ': ' + (e && (e.message || JSON.stringify(e)))); return null; }
+  }
+  if (typeof window.ethereum !== 'undefined') {
+    try {
+      var r2 = await window.ethereum.request({ method: method, params: params });
+      log('RESPONSE (injected provider) method=' + method + ' result=' + JSON.stringify(r2).slice(0, 1200));
+      return r2;
+    } catch(e) { log('ERROR (injected provider) method=' + method + ': ' + (e && (e.message || JSON.stringify(e)))); return null; }
+  }
+  log('NO SESSION AND NO PROVIDER — connect first (WalletConnect pairing in section 2, or open in a provider-injected context). Request NOT sent.');
+  return null;
+}
+
+/* ---------- calldata decode ---------- */
+function decodeCalldata(){
+  var data = val('inCalldata');
+  if (!data) { log('SKIP: decode needs calldata in the input field'); return; }
+  var abi = ['function transfer(address to,uint256 amount)','function approve(address spender,uint256 amount)','function permit(address owner,address spender,uint256 value,uint256 deadline,uint8 v,bytes32 r,bytes32 s)','function transferFrom(address from,address to,uint256 amount)','function transferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce,uint8 v,bytes32 r,bytes32 s)'];
+  try {
+    var iface = new ethers.utils.Interface(abi);
+    var parsed = iface.parseTransaction({ data: data });
+    log('DECODE selector=' + data.slice(0,10) + ' function=' + parsed.name + ' args=' + JSON.stringify(parsed.args));
+  } catch(e) {
+    var sel = data.slice(0,10);
+    log('DECODE selector=' + sel + ' UNKNOWN SELECTOR or bad calldata — no known function matched (transfer/approve/permit/transferFrom/transferWithAuthorization). Error: ' + e.message);
+  }
+}
+
+document.getElementById('btnEnv').addEventListener('click', envProbe);
+document.getElementById('btnReqAcct').addEventListener('click', requestAccounts);
+document.getElementById('btnPostParent').addEventListener('click', postToParent);
+document.getElementById('btnDecode').addEventListener('click', decodeCalldata);
+document.getElementById('btnClearLog').addEventListener('click', function(){ document.getElementById('log').textContent='[log cleared]'; });
+document.getElementById('btnCopyLog').addEventListener('click', function(){
+  var t = document.getElementById('log').textContent;
+  if (navigator.clipboard) navigator.clipboard.writeText(t).then(function(){ log('log copied to clipboard'); }, function(e){ log('clipboard copy FAILED: ' + e.message); });
+  else log('clipboard API unavailable in this context');
+});
+</script>
+
+<script>
+/* ---------- 2. WalletConnect v2 ---------- */
+function setWcStatus(s){ document.getElementById('wcStatus').textContent = 'Status: ' + s; log('WC STATUS: ' + s); }
+async function wcInit(){
+  var projectId = val('wcProjectId');
+  if (!projectId) {
+    log('WC INIT ERROR: projectId is empty. Get a free one at https://cloud.walletconnect.com (free tier, no payment) and paste it above. Pairing cannot be created without one — this failure is itself evidence for the triage file.');
+    setWcStatus('init failed — projectId required (see log)');
+    return;
+  }
+  setWcStatus('initialising SignClient…');
+  try {
+    var mod = await import('https://esm.sh/@walletconnect/sign-client@2.19.1');
+    var SignClient = mod.default;
+    TD.client = await SignClient.init({
+      projectId: projectId,
+      metadata: { name: 'Danny Test dApp (audit)', description: 'Zero-value test dApp for Danny Wallet Phase 2 audit — TB-02/TB-03 signing display tests only', url: location.href, icons: [] }
+    });
+    TD.client.on('session_proposal', function(ev){ log('WC EVENT session_proposal id=' + ev.id + ' proposer=' + JSON.stringify(ev.params.proposer.metadata).slice(0,300)); });
+    TD.client.on('session_request', function(ev){ log('WC EVENT session_request topic=' + ev.topic + ' method=' + (ev.params.request && ev.params.request.method)); });
+    TD.client.on('session_delete', function(ev){ log('WC EVENT session_delete topic=' + ev.topic); TD.session=null; TD.topic=null; TD.accounts=[]; document.getElementById('wcAccounts').textContent='(none)'; setWcStatus('session deleted by wallet'); });
+    TD.client.on('session_event', function(ev){ log('WC EVENT session_event: ' + JSON.stringify(ev).slice(0,400)); });
+    setWcStatus('SignClient ready — create a pairing next.');
+    log('WC INIT OK: SignClient ready (relay wss://relay.walletconnect.com, chain eip155:5069).');
+  } catch(e) { log('WC INIT ERROR: ' + (e && (e.message || JSON.stringify(e)))); setWcStatus('init failed — see log'); }
+}
+async function wcPair(){
+  if (!TD.client) { log('WC PAIR ERROR: SignClient not initialised — click "Init SignClient" first.'); return; }
+  setWcStatus('creating pairing…');
+  try {
+    var res = await TD.client.connect({
+      requiredNamespaces: { eip155: { chains: ['eip155:' + CHAIN], methods: ['eth_sendTransaction','personal_sign','eth_sign','eth_signTypedData','eth_signTypedData_v4'], events: ['chainChanged','accountsChanged'] } }
+    });
+    var uri = res.uri;
+    document.getElementById('wcUri').value = uri;
+    var qrEl = document.getElementById('qrcode');
+    qrEl.innerHTML = '';
+    try { new QRCode(qrEl, { text: uri, width: 200, height: 200 }); } catch(e){ log('QR render FAILED: ' + e.message + ' — use the URI text instead'); }
+    log('WC PAIRING URI (paste into wallet /wallet/connect): ' + uri);
+    setWcStatus('pairing created — waiting for wallet approval (paste the URI in the wallet)…');
+    var session = await res.approval();
+    TD.session = session; TD.topic = session.topic;
+    TD.accounts = (session.namespaces && session.namespaces.eip155 && session.namespaces.eip155.accounts) || [];
+    document.getElementById('wcAccounts').textContent = TD.accounts.join('\n') || '(none)';
+    log('WC SESSION APPROVED topic=' + session.topic + ' accounts=' + JSON.stringify(TD.accounts));
+    setWcStatus('CONNECTED — accounts: ' + TD.accounts.join(', '));
+  } catch(e) { log('WC PAIR ERROR / REJECTED: ' + (e && (e.message || JSON.stringify(e)))); setWcStatus('pairing failed or rejected — see log'); }
+}
+async function wcDisconnect(){
+  if (TD.client && TD.topic) {
+    try { await TD.client.disconnect({ topic: TD.topic, reason: { code: 6000, message: 'test done' } }); log('WC DISCONNECT OK'); }
+    catch(e) { log('WC DISCONNECT ERROR: ' + (e && e.message)); }
+  }
+  TD.session=null; TD.topic=null; TD.accounts=[];
+  document.getElementById('wcAccounts').textContent='(none)';
+  setWcStatus('disconnected.');
+}
+document.getElementById('btnWcInit').addEventListener('click', wcInit);
+document.getElementById('btnWcPair').addEventListener('click', wcPair);
+document.getElementById('btnWcDisconnect').addEventListener('click', wcDisconnect);
+document.getElementById('btnWcCopy').addEventListener('click', function(){
+  var t = document.getElementById('wcUri');
+  if (!t.value) { log('COPY URI: nothing to copy yet — create a pairing first'); return; }
+  t.select();
+  if (navigator.clipboard) navigator.clipboard.writeText(t.value).then(function(){ log('pairing URI copied to clipboard'); }, function(e){ log('URI copy FAILED: ' + e.message); });
+});
+
+/* ---------- 4. signing request builders ---------- */
+function deadline(){ return Math.floor(Date.now()/1000) + 3600; }
+function tokenAddr(){ return val('inToken'); }
+function spenderAddr(){ return val('inSpender') || SPENDER_DEFAULT; }
+function domainFor(chainId, name, version, verifyingContract){
+  return { name: name, version: version, chainId: chainId, verifyingContract: verifyingContract };
+}
+async function signTyped(label, domain, types, message){
+  var acct = getAccount();
+  if (!acct) { log('SKIP ' + label + ': no connected account — pair the wallet first (section 2).'); return; }
+  log(label + ': domain=' + JSON.stringify(domain) + ' types=' + Object.keys(types).join(',') + ' message=' + JSON.stringify(message).slice(0,600) + ' | unlimitedAck checkbox=' + document.getElementById('unlimitedAck').checked);
+  await sendReq('eth_signTypedData_v4', [acct, JSON.stringify({ domain: domain, message: message, primaryType: Object.keys(types).filter(function(k){return k!=='EIP712Domain';})[0], types: types })]);
+}
+function permit2612(token, chainId, label){
+  if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(chainId, 'DAN', '1', token);
+  var types = { Permit: [{name:'owner',type:'address'},{name:'spender',type:'address'},{name:'value',type:'uint256'},{name:'nonce',type:'uint256'},{name:'deadline',type:'uint256'}] };
+  var message = { owner: getAccount(), spender: spenderAddr(), value: ethers.constants.MaxUint256.toString(), nonce: 0, deadline: deadline() };
+  signTyped(label, domain, types, message);
+}
+document.getElementById('btnPersonal').addEventListener('click', async function(){
+  var acct = getAccount(); if (!acct) { log('SKIP personal_sign: no connected account — pair first.'); return; }
+  var msg = 'Danny Wallet audit test message — no funds, no approval of any transfer';
+  await sendReq('personal_sign', [ethers.utils.hexlify(ethers.utils.toUtf8Bytes(msg)), acct]);
+});
+document.getElementById('btnEthSign').addEventListener('click', async function(){
+  var acct = getAccount(); if (!acct) { log('SKIP eth_sign: no connected account — pair first.'); return; }
+  var hex = '0x5468697320686578206465636f64657320746f3a205452414e5346455220414c4c2046554e4453'; // "This hex decodes to: TRANSFER ALL FUNDS"
+  log('eth_sign payload hex=' + hex + ' — decodes to: "This hex decodes to: TRANSFER ALL FUNDS" (display test: does the wallet show the raw hex or the decoded text?)');
+  await sendReq('eth_sign', [acct, hex]);
+});
+document.getElementById('btnPermit2612').addEventListener('click', function(){ permit2612(tokenAddr(), CHAIN, 'PERMIT EIP-2612 UNLIMITED'); });
+document.getElementById('btnPermitAgain').addEventListener('click', function(){
+  log('PERMIT #2 stickiness check: checkbox state BEFORE firing = ' + document.getElementById('unlimitedAck').checked + ' (if it stayed checked from the first Permit, record that on the confirmation screen too)');
+  permit2612(tokenAddr(), CHAIN, 'PERMIT EIP-2612 #2 UNLIMITED (stickiness)');
+});
+document.getElementById('btnPermitSpoof').addEventListener('click', function(){ permit2612(tokenAddr(), CHAIN, 'PERMIT EIP-2612 SPOOFED TOKEN (name DAN, contract = token input)'); });
+document.getElementById('btnPermit2').addEventListener('click', function(){
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(CHAIN, 'Permit2', '1', PERMIT2_ADDR);
+  var types = { PermitSingle: [{name:'details',type:'PermitDetails'},{name:'spender',type:'address'},{name:'sigDeadline',type:'uint256'}], PermitDetails: [{name:'token',type:'address'},{name:'amount',type:'uint160'},{name:'expiration',type:'uint48'},{name:'nonce',type:'uint48'}] };
+  var message = { details: { token: token, amount: ethers.BigNumber.from(2).pow(160).sub(1).toString(), expiration: deadline(), nonce: 0 }, spender: spenderAddr(), sigDeadline: deadline() };
+  signTyped('PERMIT2 UNLIMITED', domain, types, message);
+});
+document.getElementById('btnPermitDai').addEventListener('click', function(){
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(CHAIN, 'Dai Stablecoin', '1', token);
+  var types = { Permit: [{name:'holder',type:'address'},{name:'spender',type:'address'},{name:'nonce',type:'uint256'},{name:'expiry',type:'uint256'},{name:'allowed',type:'bool'}] };
+  var message = { holder: getAccount(), spender: spenderAddr(), nonce: 0, expiry: deadline(), allowed: true };
+  signTyped('PERMIT DAI-STYLE (allowed=true)', domain, types, message);
+});
+document.getElementById('btnPermit3009').addEventListener('click', function(){
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(CHAIN, 'DAN', '1', token);
+  var types = { TransferWithAuthorization: [{name:'from',type:'address'},{name:'to',type:'address'},{name:'value',type:'uint256'},{name:'validAfter',type:'uint256'},{name:'validBefore',type:'uint256'},{name:'nonce',type:'bytes32'}] };
+  var message = { from: getAccount(), to: spenderAddr(), value: 0, validAfter: 0, validBefore: deadline(), nonce: ethers.utils.hexlify(ethers.utils.randomBytes(32)) };
+  signTyped('PERMIT EIP-3009 transferWithAuthorization (value 0)', domain, types, message);
+});
+document.getElementById('btnNested').addEventListener('click', function(){
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(CHAIN, 'Danny Test Order', '1', token);
+  var types = { Order: [{name:'maker',type:'address'},{name:'items',type:'Item[]'}], Item: [{name:'token',type:'address'},{name:'amount',type:'uint256'}] };
+  var message = { maker: getAccount(), items: [{ token: token, amount: 0 }, { token: token, amount: 123 }] };
+  signTyped('TYPED-DATA NESTED/ARRAY (decoder truncation test)', domain, types, message);
+});
+document.getElementById('btnMulticall').addEventListener('click', async function(){
+  var acct = getAccount(); if (!acct) { log('SKIP multicall: no connected account — pair first.'); return; }
+  var mc = val('inMulticall'); if (!needAddr(mc, 'multicall address')) return;
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  try {
+    var iface = new ethers.utils.Interface(['function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) returns (tuple(bool success,bytes returnData)[])']);
+    var erc20 = new ethers.utils.Interface(['function transfer(address to,uint256 amount) returns (bool)','function approve(address spender,uint256 amount) returns (bool)']);
+    var data = iface.encodeFunctionData('aggregate3', [[
+      { target: token, allowFailure: false, callData: erc20.encodeFunctionData('transfer', [spenderAddr(), 0]) },
+      { target: token, allowFailure: false, callData: erc20.encodeFunctionData('approve', [spenderAddr(), ethers.constants.MaxUint256]) }
+    ]]);
+    log('MULTICALL tx (value 0): to=' + mc + ' legs=[transfer(spender,0), approve(spender,MaxUint256)] — does the confirmation screen show BOTH legs?');
+    await sendReq('eth_sendTransaction', [{ from: acct, to: mc, value: '0x0', data: data }]);
+  } catch(e) { log('MULTICALL ENCODE ERROR: ' + e.message); }
+});
+document.getElementById('btnLookalike').addEventListener('click', async function(){
+  var acct = getAccount(); if (!acct) { log('SKIP lookalike send: no connected account — pair first.'); return; }
+  var to = val('inRecipient'); if (!needAddr(to, 'lookalike recipient')) return;
+  log('LOOKALIKE SEND (value 0): to=' + to + ' — does the confirmation screen show the FULL address or truncate it to prefix/suffix?');
+  await sendReq('eth_sendTransaction', [{ from: acct, to: to, value: '0x0', data: '0x' }]);
+});
+document.getElementById('btnChainOk').addEventListener('click', function(){
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(CHAIN, 'DAN', '1', token);
+  var types = { Permit: [{name:'owner',type:'address'},{name:'spender',type:'address'},{name:'value',type:'uint256'},{name:'nonce',type:'uint256'},{name:'deadline',type:'uint256'}] };
+  signTyped('TYPED-DATA chainId 5069 (CORRECT)', domain, types, { owner: getAccount(), spender: spenderAddr(), value: 0, nonce: 0, deadline: deadline() });
+});
+document.getElementById('btnChainWrong').addEventListener('click', function(){
+  var token = tokenAddr(); if (!needAddr(token, 'token address')) return;
+  var domain = domainFor(1, 'DAN', '1', token);
+  var types = { Permit: [{name:'owner',type:'address'},{name:'spender',type:'address'},{name:'value',type:'uint256'},{name:'nonce',type:'uint256'},{name:'deadline',type:'uint256'}] };
+  log('CHAIN MISMATCH TEST: domain chainId=1 (Ethereum mainnet) while the wallet UI is on Danny Chain 5069 — does the confirmation screen show the chain, and does it match the signed chain?');
+  signTyped('TYPED-DATA chainId 1 (WRONG)', domain, types, { owner: getAccount(), spender: spenderAddr(), value: 0, nonce: 0, deadline: deadline() });
+});
+document.getElementById('btnReplay').addEventListener('click', async function(){
+  var acct = getAccount(); if (!acct) { log('SKIP replay: no connected account — pair first.'); return; }
+  var msg = 'Danny Wallet audit replay test — request 1 of 2 (same message twice)';
+  log('REPLAY: firing the SAME personal_sign twice in a row — is a fresh confirmation + PIN required the second time?');
+  await sendReq('personal_sign', [ethers.utils.hexlify(ethers.utils.toUtf8Bytes(msg)), acct]);
+  await sendReq('personal_sign', [ethers.utils.hexlify(ethers.utils.toUtf8Bytes(msg)), acct]);
+});
+document.getElementById('btnRace').addEventListener('click', async function(){
+  if (TD.accounts.length < 2) { log('RACE: only ' + TD.accounts.length + ' account(s) in the session — the A/B switch test needs two accounts. Pair with the wallet showing both accounts, or switch accounts in the wallet mid-flight and use the single-account path instead.'); }
+  var a1 = TD.accounts[0] ? TD.accounts[0].split(':').pop() : getAccount();
+  var a2 = TD.accounts[1] ? TD.accounts[1].split(':').pop() : null;
+  if (!a1) { log('SKIP race: no connected account — pair first.'); return; }
+  var m1 = 'race test — request from account 1';
+  log('RACE: firing personal_sign from account 1, then IMMEDIATELY from account 2 (if available) — which account signs, and is the second request rejected?');
+  var p1 = sendReq('personal_sign', [ethers.utils.hexlify(ethers.utils.toUtf8Bytes(m1)), a1]);
+  var p2 = a2 ? sendReq('personal_sign', [ethers.utils.hexlify(ethers.utils.toUtf8Bytes('race test — request from account 2')), a2]) : Promise.resolve(log('RACE: no second account — second leg skipped'));
+  await Promise.all([p1, p2]);
+});
+
+/* ---------- 5. origin confusion ---------- */
+document.getElementById('btnForgeMsg').addEventListener('click', function(){
+  log('FORGED postMessage SIMULATION: dispatching a synthetic MessageEvent with origin https://evil.example and a fake wallet message — this is what a malicious origin COULD send; the page must only log it, never act on it.');
+  window.dispatchEvent(new MessageEvent('message', { origin: 'https://evil.example', data: { type: 'wallet-connect', method: 'personal_sign', params: ['0x66616b65', '0x0000000000000000000000000000000000000000'] } }));
+  log('FORGED message dispatched. If the log line above shows origin=https://evil.example and NO request was sent, the page correctly ignored it.');
+});
+document.getElementById('btnSessionReuse').addEventListener('click', async function(){
+  var acct = getAccount(); if (!acct) { log('SKIP session-reuse probe: no connected account — pair first.'); return; }
+  log('SESSION-REUSE PROBE: the unrelated-origin iframe (example.com) is loaded on this page; firing personal_sign again — does the wallet still honour the session from THIS origin, and does the prompt name the correct origin?');
+  await sendReq('personal_sign', [ethers.utils.hexlify(ethers.utils.toUtf8Bytes('session-reuse probe after loading unrelated iframe')), acct]);
+});
+
+/* ---------- on load ---------- */
+window.addEventListener('load', function(){ envProbe(); log('Test dApp ready. Steps: (1) check the environment probe above; (2) paste a free WalletConnect Cloud projectId and Init + Create pairing; (3) paste the URI into the wallet /wallet/connect; (4) fire the signing buttons one at a time and record each confirmation screen verbatim.'); });
+</script>
+</body>
+</html>
